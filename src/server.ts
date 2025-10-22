@@ -5,32 +5,32 @@ import Redis from 'ioredis';
 import mongoose, { Schema, Document } from 'mongoose';
 import assert from 'assert';
 
-/** ========== 1) 初始化各服务：Redis & Mongo ========== */
+/** ========== 1) 初始化各服务：仅使用 REDIS_ADDRESS / MONGO_ADDRESS ========== */
 async function initService() {
-  const {
-    REDIS_ADDRESS,
-    REDIS_USERNAME,
-    REDIS_PASSWORD,
-    MONGO_ADDRESS,
-    MONGO_USERNAME,
-    MONGO_PASSWORD,
-  } = process.env;
+  const { REDIS_ADDRESS, MONGO_ADDRESS } = process.env as Record<string, string | undefined>;
 
-  const [REDIS_HOST, REDIS_PORT] = (REDIS_ADDRESS || '').split(':');
+  // --- Redis（仅 host:port）---
+  assert(REDIS_ADDRESS && REDIS_ADDRESS.includes(':'), 'REDIS_ADDRESS 必须形如 host:port');
+  const [REDIS_HOST, REDIS_PORT_STR] = REDIS_ADDRESS.split(':');
+  const REDIS_PORT = parseInt(REDIS_PORT_STR!, 10);
+  assert(Number.isFinite(REDIS_PORT), 'REDIS_ADDRESS 的端口必须是数字');
+
   const redis = new Redis({
-    port: parseInt(REDIS_PORT || '6379', 10),
-    host: REDIS_HOST || '127.0.0.1',
-    username: REDIS_USERNAME,
-    password: REDIS_PASSWORD,
+    host: REDIS_HOST!,
+    port: REDIS_PORT,
     db: 0,
+    // 防止启动期卡死
+    connectTimeout: 5000,
   });
 
-  assert((await redis.echo('echo')) === 'echo', `redis echo error`);
+  assert((await redis.echo('echo')) === 'echo', 'redis echo error');
 
-  const mongoUrl = `mongodb://${MONGO_USERNAME}:${encodeURIComponent(
-    MONGO_PASSWORD || ''
-  )}@${MONGO_ADDRESS}`;
-  await mongoose.connect(mongoUrl);
+  // --- Mongo（仅 mongodb://host:port/dbname）---
+  assert(MONGO_ADDRESS && MONGO_ADDRESS.length > 0, 'MONGO_ADDRESS 不能为空');
+  const mongoUrl = `mongodb://${MONGO_ADDRESS}`;
+  await mongoose.connect(mongoUrl, {
+    serverSelectionTimeoutMS: 5000, // 5s 选主超时
+  } as any);
 
   return { redis, mongoose };
 }
@@ -73,39 +73,26 @@ async function ensureUser(openId: string, profile?: Partial<IUser>) {
   return doc!;
 }
 
-/** ========== 4) 启动应用并注册路由 ========== */
+/** ========== 4) 启动应用并注册路由（端口写死 8000；健康检查文案一致） ========== */
 initService()
   .then(({ redis }) => {
     const app = new Koa();
     const router = new Router();
 
-    /** 健康检查 */
+    // 健康检查：与 demo 一致
     router.get('/', (ctx) => {
-      ctx.body = `Nodejs koa demo project (wallet ready)`;
+      ctx.body = `Nodejs koa demo project`;
     });
 
-    /**
-     * GET /api/wallet?openId=xxx
-     * 根据登录用户 openId 获取钻石数量
-     */
+    // 根据 openId 获取钻石
     router.get('/api/wallet', async (ctx) => {
       const openId = String(ctx.query.openId || '');
       assert(openId?.trim(), 'openId is required');
-
       const user = await ensureUser(openId);
-      ctx.body = {
-        success: true,
-        openId,
-        diamonds: user.diamonds,
-      };
+      ctx.body = { success: true, openId, diamonds: user.diamonds };
     });
 
-    /**
-     * POST /api/wallet/add?openId=xxx
-     * body: { amount: number, nickname?, avatarUrl? }
-     * 原子自增 diamonds 并返回最新值
-     * （示例包含一个简单的每日限流：同一 openId 每天最多加 10000）
-     */
+    // 增加钻石
     router.post('/api/wallet/add', async (ctx) => {
       const openId = String(ctx.query.openId || '');
       assert(openId?.trim(), 'openId is required');
@@ -114,50 +101,34 @@ initService()
       const n = Number(body.amount);
       assert(Number.isFinite(n) && n > 0, 'amount must be a positive number');
 
-      // 可选：更新昵称头像（第一次写入或之后补全）
       const { nickname, avatarUrl } = body || {};
       if (nickname || avatarUrl) {
         await ensureUser(openId, { nickname, avatarUrl });
       }
 
-      // —— 简单防刷：每日额度控制（可按需调整/删除）——
-      const DAILY_LIMIT = Number(process.env.WALLET_DAILY_LIMIT || 10000);
-      const dayKey = `wallet:add:${openId}:${new Date()
-        .toISOString()
-        .slice(0, 10)}`; // 2025-10-22
+      const DAILY_LIMIT = 10000; // 固定阈值，不依赖环境变量
+      const dayKey = `wallet:add:${openId}:${new Date().toISOString().slice(0, 10)}`;
       const cur = await redis.get(dayKey);
       const used = cur ? Number(cur) : 0;
       assert(used + n <= DAILY_LIMIT, 'exceed daily add limit');
 
-      // 写入今日累计
-      const ttlSec =
-        24 * 60 * 60 -
-        Math.floor((Date.now() % (24 * 60 * 60 * 1000)) / 1000); // 当天剩余秒数
+      const ttlSec = 24 * 60 * 60 - Math.floor((Date.now() % (24 * 60 * 60 * 1000)) / 1000);
       await redis.set(dayKey, String(used + n), 'EX', ttlSec);
 
-      // —— Mongo 原子自增 diamonds 并返回最新文档 —— //
       const updated = await User.findOneAndUpdate(
         { openId },
-        {
-          $inc: { diamonds: n },
-          $set: { updatedAt: Date.now() },
-          $setOnInsert: { openId, diamonds: 0 },
-        },
+        { $inc: { diamonds: n }, $set: { updatedAt: Date.now() }, $setOnInsert: { openId, diamonds: 0 } },
         { new: true, upsert: true }
       );
 
-      ctx.body = {
-        success: true,
-        openId,
-        add: n,
-        diamonds: updated?.diamonds ?? 0,
-      };
+      ctx.body = { success: true, openId, add: n, diamonds: updated?.diamonds ?? 0 };
     });
 
     app.use(bodyParser());
     app.use(router.routes()).use(router.allowedMethods());
 
-    const PORT = Number(process.env.PORT || 8000);
+    // 端口固定 8000
+    const PORT = 8000;
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
