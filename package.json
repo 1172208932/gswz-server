@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@koa/router": "^10.0.0",
+    "axios": "^1.12.2",
     "ioredis": "^5.2.3",
     "koa": "^2.13.1",
     "koa-bodyparser": "^4.3.0",
