@@ -1,20 +1,24 @@
-// app.ts（或 router 文件）
 import Koa from 'koa';
-import Router from '@koa/router';
 import bodyParser from 'koa-bodyparser';
+import Router from '@koa/router';
 import axios from 'axios';
 
 const app = new Koa();
 const router = new Router();
 
-// 环境配置（从环境变量读取）
-const DOYIN_APP_ID = process.env.DOUYIN_APP_ID!;        // 抖音小游戏 AppID（client_key）
-const DOYIN_APP_SECRET = process.env.DOUYIN_APP_SECRET!; // 抖音小游戏 AppSecret
+// ===== 内存钱包（进程重启会清空） =====
+const wallet = new Map<string, number>(); // openId -> diamonds
 
-// 简单内存钱包（示例）
-const wallet = new Map<string, number>(); // openid -> diamonds
+// ====== 抖音配置（从开发者后台复制 AppID / AppSecret）======
+const DOUYIN_APPID = 'ttde2aa897411cfdb002'; // client_key
+const DOUYIN_SECRET = 'da8c3ea2ea1779c6c482713c982d42062b514aa1'; // app_secret
 
-// 1) 登录换 session（openid/unionid）
+// ===== 首页 =====
+router.get('/', (ctx) => {
+  ctx.body = `Node.js Koa demo project (Douyin mini-game)`;
+});
+
+// ====== 登录：用 code 换 openid / unionid ======
 router.post('/api/auth/code2session', async (ctx) => {
   const { code } = ctx.request.body as { code: string };
   if (!code) {
@@ -22,63 +26,86 @@ router.post('/api/auth/code2session', async (ctx) => {
     return;
   }
 
-  // 抖音 “code2session” 接口（示例 URL，按官方最新文档为准）
-  // 典型为：
-  // https://developer.toutiao.com/api/apps/jscode2session
-  // 或 https://open.douyin.com/api/apps/v2/jscode2session
-  const url = 'https://developer.toutiao.com/api/apps/jscode2session';
-  const params = {
-    appid: DOYIN_APP_ID,         // 有的文档用 appid，有的用 appid/client_key
-    secret: DOYIN_APP_SECRET,    // 有的文档用 secret，有的用 app_secret
-    code,
-    grant_type: 'authorization_code',
-  };
+  try {
+    // 抖音官方登录接口
+    const resp = await axios.get('https://developer.toutiao.com/api/apps/jscode2session', {
+      params: {
+        appid: DOUYIN_APPID,
+        secret: DOUYIN_SECRET,
+        code,
+        grant_type: 'authorization_code',
+      },
+    });
 
-  const resp = await axios.get(url, { params });
-  // 返回示例：{ openid, anonymous_openid, session_key, unionid? }
-  const { openid, unionid, session_key, error, errcode, errmsg } = resp.data || {};
-  if (!openid || errcode) {
-    ctx.body = { success: false, message: errmsg || 'code2session failed', data: resp.data };
-    return;
+    const { openid, unionid, errcode, errmsg } = resp.data || {};
+    if (errcode) {
+      ctx.body = { success: false, message: errmsg || 'code2session failed' };
+      return;
+    }
+
+    // 登录成功
+    ctx.body = {
+      success: true,
+      data: {
+        openid,
+        unionid,
+      },
+    };
+  } catch (err: any) {
+    ctx.body = { success: false, message: 'request to douyin failed', detail: err.message };
   }
-
-  // 这里你可以签发你自己的 token（可选）
-  // const token = signJWT({ openid }, '7d');
-
-  ctx.body = {
-    success: true,
-    data: {
-      openid,
-      unionid,         // 如果你已在抖音后台开通 unionid 能力并满足条件，就能拿到
-      // token,
-    },
-  };
 });
 
-// 2) 你的钱包接口（从 Header 取 openid/unionid）
-router.get('/api/wallet', async (ctx) => {
-  const openId = (ctx.request.header['x-tt-openid'] || '') as string;
-  const unionId = (ctx.request.header['x-tt-unionid'] || '') as string;
+// ====== 获取 open_id（来自请求头）======
+router.get('/api/get_open_id', async (ctx) => {
+  const openId = ctx.request.header['x-tt-openid'] as string;
+  if (openId) {
+    ctx.body = { success: true, data: openId };
+  } else {
+    ctx.body = { success: false, message: 'x-tt-openid not exist' };
+  }
+});
 
+// ====== 获取钻石余额 ======
+router.get('/api/wallet', (ctx) => {
+  const openId = ctx.request.header['x-tt-openid'] as string;
   if (!openId) {
-    ctx.body = { success: false, message: 'missing x-tt-openid' };
+    ctx.body = { success: false, message: 'x-tt-openid not exist' };
     return;
   }
 
   const diamonds = wallet.get(openId) ?? 0;
-  ctx.body = { success: true, data: { openId, unionId, diamonds } };
+  ctx.body = { success: true, openId, diamonds };
 });
 
-// 3) 简单加钻（示例）
-router.post('/api/wallet/add', async (ctx) => {
-  const openId = (ctx.request.header['x-tt-openid'] || '') as string;
-  const { amount = 10 } = ctx.request.body as { amount: number };
-  const curr = wallet.get(openId) ?? 0;
-  wallet.set(openId, curr + amount);
-  ctx.body = { success: true, data: { diamonds: wallet.get(openId) } };
+// ====== 增加钻石 ======
+router.post('/api/wallet/add', (ctx) => {
+  const openId = ctx.request.header['x-tt-openid'] as string;
+  if (!openId) {
+    ctx.body = { success: false, message: 'x-tt-openid not exist' };
+    return;
+  }
+
+  const body: any = ctx.request.body || {};
+  const amount = Number(body.amount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    ctx.body = { success: false, message: 'amount must be a positive number' };
+    return;
+  }
+
+  const cur = wallet.get(openId) ?? 0;
+  const next = cur + amount;
+  wallet.set(openId, next);
+
+  ctx.body = { success: true, openId, add: amount, diamonds: next };
 });
 
 app.use(bodyParser());
 app.use(router.routes());
 app.use(router.allowedMethods());
-app.listen(3000);
+
+// ====== 启动服务 ======
+const PORT = 8000;
+app.listen(PORT, () => {
+  console.log(`✅ Server running on http://localhost:${PORT}`);
+});
