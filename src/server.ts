@@ -80,7 +80,11 @@ router.get('/api/get_open_id', async (ctx) => {
 
 // ====== 获取钻石余额（扩展返回是否今日已领 & 下一次可领时间） ======
 router.get('/api/wallet', (ctx) => {
-  const openId = ctx.request.header['x-tt-openid'] as string;
+  const h = ctx.request.headers;
+  const openId =
+    (h['x-tt-openid'] as string) ||
+    (h['x-tt-openId'] as string) ||
+    (ctx.query.openId as string);
   if (!openId) {
     ctx.body = { success: false, message: 'x-tt-openid not exist' };
     return;
